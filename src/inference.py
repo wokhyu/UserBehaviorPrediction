@@ -8,11 +8,12 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from src.config import ATTR_COLUMNS, TrainConfig
+from src.config import ATTR_COLUMNS, TrainConfig, default_model_name_for_type
 from src.dataset import BehaviorDataset
 from src.evaluate import build_model_from_checkpoint
+from src.model import BehaviorXGBoostModel
 from src.preprocessing import BehaviorPreprocessor
-from src.utils import load_checkpoint
+from src.utils import load_checkpoint, resolve_torch_device, set_seed
 
 
 def predict_test(
@@ -49,16 +50,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preprocessor-path", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=Path("team_name.csv"))
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default="auto",
+        choices=["auto", "transformer", "bilstm_gcn", "xgboost"],
+    )
     return parser.parse_args()
+
+
+def resolve_model_type(model_path: Path, checkpoint_payload, user_model_type: str) -> str:
+    if user_model_type != "auto":
+        return user_model_type
+    if model_path.suffix.lower() == ".pkl":
+        return "xgboost"
+    if isinstance(checkpoint_payload, dict):
+        return checkpoint_payload.get("model_type", "transformer")
+    return "transformer"
 
 
 def main() -> None:
     args = parse_args()
-    config = TrainConfig(data_dir=args.data_dir, model_dir=args.artifact_dir, device=args.device)
+    resolved_device = resolve_torch_device(args.device)
+    config = TrainConfig(data_dir=args.data_dir, model_dir=args.artifact_dir, device=str(resolved_device))
+    set_seed(args.seed)
 
     preprocessor_path = args.preprocessor_path or (config.model_dir / config.preprocessor_name)
-    model_path = args.model_path or (config.model_dir / config.model_name)
+    if args.model_path:
+        model_path = args.model_path
+    else:
+        default_type = "transformer" if args.model_type == "auto" else args.model_type
+        model_path = config.model_dir / default_model_name_for_type(default_type)
 
     x_test = pd.read_csv(config.data_dir / "X_test.csv")
 
@@ -68,11 +92,22 @@ def main() -> None:
     test_dataset = BehaviorDataset(sequences=seqs, masks=masks, aux_features=aux, ids=ids)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
-    device = torch.device(config.device)
-    checkpoint_payload = load_checkpoint(model_path, map_location=config.device)
-    model = build_model_from_checkpoint(checkpoint_payload, preprocessor, config, device)
+    checkpoint_payload = None
+    if model_path.suffix.lower() != ".pkl":
+        checkpoint_payload = load_checkpoint(model_path, map_location=config.device)
 
-    pred_ids, pred_encoded = predict_test(model, test_loader, device)
+    model_type = resolve_model_type(model_path, checkpoint_payload, args.model_type)
+
+    if model_type == "xgboost":
+        tab = preprocessor.build_tabular_features(seqs, masks, aux)
+        model = BehaviorXGBoostModel.load(model_path)
+        pred_encoded = model.predict(tab)
+        pred_ids = ids
+    else:
+        device = resolve_torch_device(config.device)
+        model = build_model_from_checkpoint(checkpoint_payload, preprocessor, config, device)
+        pred_ids, pred_encoded = predict_test(model, test_loader, device)
+
     pred_decoded = preprocessor.decode_predictions(pred_encoded).astype(np.int64)
 
     submission_df = pd.DataFrame(

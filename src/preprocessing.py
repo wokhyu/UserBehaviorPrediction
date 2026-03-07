@@ -116,6 +116,17 @@ class BehaviorPreprocessor:
             ids,
         )
 
+    def build_tabular_features(
+        self,
+        sequences: np.ndarray,
+        masks: np.ndarray,
+        aux_features: np.ndarray,
+    ) -> np.ndarray:
+        seq_float = sequences.astype(np.float32)
+        mask_float = masks.astype(np.float32)
+        aux_float = aux_features.astype(np.float32)
+        return np.concatenate([seq_float, mask_float, aux_float], axis=1)
+
     def transform_labels(self, y_df: pd.DataFrame, strict: bool = True) -> np.ndarray:
         if not self.label_encoders:
             raise RuntimeError("Preprocessor must be fit before transform_labels.")
